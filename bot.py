@@ -22,7 +22,8 @@ TOKEN = os.getenv("TOKEN")
 # Список админов (ID из вашего сообщения)
 ADMINS = {8133757512, 5815094886}
 
-DATA_DIR = Path("data")
+# Use a path relative to this file so running from a different CWD still works.
+DATA_DIR = BASE_DIR / "data"
 CATS_FILE = DATA_DIR / "categories.json"
 PROD_FILE = DATA_DIR / "products.json"
 CART_FILE = DATA_DIR / "carts.json"
@@ -142,11 +143,11 @@ async def notify_users_product_available(context: ContextTypes.DEFAULT_TYPE, pro
     _write_wait_notify_map(data)
 
 
-def read_json(path: Path):
+def read_json(path: Path, default=None):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return []
+        return default if default is not None else []
 
 
 def write_json(path: Path, data):
@@ -186,41 +187,281 @@ def remove_admin(admin_id: int):
     write_json(ADMINS_FILE, ids)
 
 
-def add_to_cart(user_id: int, prod_id: int):
-    data = read_json(CART_FILE)
-    rec = next((r for r in data if r.get("user_id") == user_id), None)
-    if not rec:
-        rec = {"user_id": user_id, "items": []}
-        data.append(rec)
-    if prod_id not in rec["items"]:
-        rec["items"].append(prod_id)
-    write_json(CART_FILE, data)
+def _cart_lock_path() -> Path:
+    return DATA_DIR / ".lock_carts"
+
+
+def _products_lock_path() -> Path:
+    return DATA_DIR / ".lock_products"
+
+
+def _interprocess_lock(lock_path: Path):
+    """Simple cross-platform interprocess lock using a lock file."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _lock():
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(lock_path, "a+b")
+        try:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                # If locking fails, continue without a hard lock (best-effort)
+                pass
+            yield
+        finally:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    return _lock()
+
+
+def _normalize_cart_items(items, prods_by_id: dict[int, dict] | None = None):
+    """Normalize cart items to list of dicts: {product_id, qty, price}."""
+    if not isinstance(items, list):
+        return []
+    if not items:
+        return []
+
+    # New format
+    if isinstance(items[0], dict):
+        out = []
+        for it in items:
+            try:
+                pid = int(it.get("product_id") if it.get("product_id") is not None else it.get("id"))
+            except Exception:
+                continue
+            try:
+                qty = int(it.get("qty", 1) or 1)
+            except Exception:
+                qty = 1
+            if qty < 1:
+                qty = 1
+            price = it.get("price")
+            if price is None and prods_by_id and pid in prods_by_id:
+                price = prods_by_id[pid].get("price", 0)
+            out.append({"product_id": pid, "qty": qty, "price": price if price is not None else 0})
+        return out
+
+    # Legacy format: list of product IDs
+    out = []
+    for raw in items:
+        try:
+            pid = int(raw)
+        except Exception:
+            continue
+        price = 0
+        if prods_by_id and pid in prods_by_id:
+            price = prods_by_id[pid].get("price", 0)
+        out.append({"product_id": pid, "qty": 1, "price": price})
+    return out
+
+
+def _read_cart_data() -> list:
+    data = read_json(CART_FILE, default=[])
+    return data if isinstance(data, list) else []
+
+
+def get_cart_items(user_id: int) -> list[dict]:
+    """Return cart items for user in normalized new format. Migrates legacy format on read."""
+    with _interprocess_lock(_cart_lock_path()):
+        data = _read_cart_data()
+        rec = next((r for r in data if int(r.get("user_id", 0)) == int(user_id)), None)
+        if not rec:
+            return []
+        items_raw = rec.get("items", [])
+        prods = read_json(PROD_FILE, default=[])
+        prods_by_id = {int(p.get("id")): p for p in prods if p.get("id") is not None}
+        items_norm = _normalize_cart_items(items_raw, prods_by_id=prods_by_id)
+        # Write back if migrated/normalized
+        if items_norm != items_raw:
+            rec["items"] = items_norm
+            write_json(CART_FILE, data)
+        return items_norm
+
+
+def is_in_cart(user_id: int, prod_id: int) -> bool:
+    try:
+        pid = int(prod_id)
+    except Exception:
+        return False
+    for it in get_cart_items(int(user_id)):
+        if int(it.get("product_id", 0)) == pid:
+            return True
+    return False
+
+
+def add_to_cart(user_id: int, prod_id: int, qty: int = 1, price=0):
+    """Add/increment product in cart (new schema)."""
+    try:
+        pid = int(prod_id)
+    except Exception:
+        return
+    try:
+        qty_i = int(qty or 1)
+    except Exception:
+        qty_i = 1
+    if qty_i < 1:
+        qty_i = 1
+
+    with _interprocess_lock(_cart_lock_path()):
+        data = _read_cart_data()
+        rec = next((r for r in data if int(r.get("user_id", 0)) == int(user_id)), None)
+        if not rec:
+            rec = {"user_id": int(user_id), "items": []}
+            data.append(rec)
+
+        prods = read_json(PROD_FILE, default=[])
+        prods_by_id = {int(p.get("id")): p for p in prods if p.get("id") is not None}
+        items_norm = _normalize_cart_items(rec.get("items", []), prods_by_id=prods_by_id)
+
+        found = False
+        for it in items_norm:
+            if int(it.get("product_id", 0)) == pid:
+                it["qty"] = int(it.get("qty", 1) or 1) + qty_i
+                # keep stored price if present; otherwise set it
+                if it.get("price") is None:
+                    it["price"] = price
+                found = True
+                break
+        if not found:
+            items_norm.append({"product_id": pid, "qty": qty_i, "price": price})
+        rec["items"] = items_norm
+        write_json(CART_FILE, data)
 
 
 def get_cart(user_id: int):
-    data = read_json(CART_FILE)
-    rec = next((r for r in data if r.get("user_id") == user_id), None)
-    return rec["items"] if rec else []
+    """Backward-compatible: return list of product IDs in cart."""
+    out = []
+    for it in get_cart_items(int(user_id)):
+        try:
+            out.append(int(it.get("product_id")))
+        except Exception:
+            pass
+    return out
 
 
 def clear_cart(user_id: int):
-    data = read_json(CART_FILE)
-    data = [r for r in data if r.get("user_id") != user_id]
-    write_json(CART_FILE, data)
+    with _interprocess_lock(_cart_lock_path()):
+        data = _read_cart_data()
+        data = [r for r in data if int(r.get("user_id", 0)) != int(user_id)]
+        write_json(CART_FILE, data)
 
 
 def remove_from_cart(user_id: int, prod_id: int):
-    data = read_json(CART_FILE)
-    changed = False
-    for r in data:
-        if r.get("user_id") == user_id:
-            items = r.get("items", [])
-            if prod_id in items:
-                r["items"] = [i for i in items if i != prod_id]
-                changed = True
-            break
-    if changed:
-        write_json(CART_FILE, data)
+    try:
+        pid = int(prod_id)
+    except Exception:
+        return
+    with _interprocess_lock(_cart_lock_path()):
+        data = _read_cart_data()
+        changed = False
+        for r in data:
+            if int(r.get("user_id", 0)) == int(user_id):
+                prods = read_json(PROD_FILE, default=[])
+                prods_by_id = {int(p.get("id")): p for p in prods if p.get("id") is not None}
+                items_norm = _normalize_cart_items(r.get("items", []), prods_by_id=prods_by_id)
+                new_items = [it for it in items_norm if int(it.get("product_id", 0)) != pid]
+                if new_items != items_norm:
+                    r["items"] = new_items
+                    changed = True
+                break
+        if changed:
+            write_json(CART_FILE, data)
+
+
+def _reserve_stock_for_pending(pending: dict) -> tuple[bool, str | None]:
+    """Reserve stock (decrement from products) for a pending order atomically under a file lock."""
+    try:
+        items = pending.get("items", []) or []
+    except Exception:
+        items = []
+    if not items:
+        return False, "Пустой заказ"
+
+    with _interprocess_lock(_products_lock_path()):
+        prods_all = read_json(PROD_FILE, default=[])
+        prods_by_id = {int(p.get("id")): p for p in prods_all if p.get("id") is not None}
+
+        # validate
+        for it in items:
+            try:
+                pid = int(it.get("product_id"))
+                qty = int(it.get("qty", 1) or 1)
+            except Exception:
+                return False, "Некорректные товары"
+            if qty < 1:
+                qty = 1
+            prod = prods_by_id.get(pid)
+            if not prod:
+                return False, "Один из товаров удалён"
+            stock = int(prod.get("stock", 0) or 0)
+            if stock < qty:
+                name = (prod.get("name") or f"#{pid}").strip()
+                return False, f"Недостаточно товара: {name} (доступно {stock})"
+
+        # apply
+        for it in items:
+            pid = int(it.get("product_id"))
+            qty = int(it.get("qty", 1) or 1)
+            prod = prods_by_id.get(pid)
+            prod["stock"] = max(0, int(prod.get("stock", 0) or 0) - qty)
+
+        write_json(PROD_FILE, prods_all)
+
+    # mark reserved on pending
+    try:
+        from time import time
+        pending["reserved"] = True
+        pending["reserved_at"] = time()
+    except Exception:
+        pass
+    return True, None
+
+
+def _release_stock_for_pending(pending: dict) -> None:
+    """Release previously reserved stock back to products (best-effort)."""
+    try:
+        if not pending.get("reserved"):
+            return
+        items = pending.get("items", []) or []
+    except Exception:
+        return
+    if not items:
+        return
+    with _interprocess_lock(_products_lock_path()):
+        prods_all = read_json(PROD_FILE, default=[])
+        prods_by_id = {int(p.get("id")): p for p in prods_all if p.get("id") is not None}
+        for it in items:
+            try:
+                pid = int(it.get("product_id"))
+                qty = int(it.get("qty", 1) or 1)
+            except Exception:
+                continue
+            prod = prods_by_id.get(pid)
+            if not prod:
+                continue
+            prod["stock"] = int(prod.get("stock", 0) or 0) + max(1, qty)
+        write_json(PROD_FILE, prods_all)
 
 
 def add_to_fav(user_id: int, prod_id: int):
@@ -537,10 +778,7 @@ def save_broadcast_record(entry):
 
 
 def read_addresses():
-    try:
-        return json.loads(ADDR_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return read_json(ADDR_FILE, default={})
 
 
 def write_addresses(data):
@@ -548,10 +786,7 @@ def write_addresses(data):
 
 
 def read_profiles():
-    try:
-        return json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return read_json(PROFILE_FILE, default={})
 
 
 def write_profiles(data):
@@ -570,7 +805,8 @@ def next_order_number():
     # number independent sequence including pending
     orders = read_orders()
     pend = read_pending_orders()
-    return 1000 + len(orders) + len(pend) + 1
+    all_numbers = [o.get("number", 0) for o in orders + pend]
+    return max(all_numbers, default=1000) + 1
 
 
 def create_pending_order(user, items, address_text: str, delivery_method: str | None, order_type: str | None = None):
@@ -1274,8 +1510,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
         try:
             qty = int(update.message.text.strip())
+            if qty <= 0:
+                raise ValueError
         except ValueError:
-            await update.message.reply_text("Введите целое число для пополнения.")
+            await update.message.reply_text("❌ Введите положительное целое число для пополнения.")
             return
         prods = read_json(PROD_FILE)
         name = None
@@ -1375,17 +1613,35 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # save cart + address as pending and ask for delivery method
         address = text.strip()
         user = update.effective_user.id
-        items_ids = get_cart(user)
-        if not items_ids:
+        cart_items = get_cart_items(user)
+        if not cart_items:
             await update.message.reply_text("Ваша корзина пуста.")
             context.user_data.pop("state", None)
             return
         prods = read_json(PROD_FILE)
+        prods_by_id = {int(p.get("id")): p for p in prods if p.get("id") is not None}
         items = []
-        for pid in items_ids:
-            p = next((x for x in prods if x.get("id") == pid), None)
-            if p:
-                items.append({"product_id": p.get('id'), "name": p.get('name'), "qty": 1, "price": p.get('price',0)})
+        for ci in cart_items:
+            try:
+                pid = int(ci.get("product_id"))
+                qty = int(ci.get("qty", 1) or 1)
+            except Exception:
+                continue
+            p = prods_by_id.get(pid)
+            if not p:
+                await update.message.reply_text("❌ Один из товаров в корзине был удалён")
+                context.user_data.pop("state", None)
+                return
+            stock = int(p.get("stock", 0) or 0)
+            if stock <= 0 or qty > stock:
+                name = (p.get("name") or "-").strip()
+                await update.message.reply_text(f"❌ Недостаточно товара: {name}\nДоступно: {stock}")
+                context.user_data.pop("state", None)
+                return
+            price = ci.get("price")
+            if price is None:
+                price = p.get("price", 0)
+            items.append({"product_id": pid, "name": p.get('name'), "qty": qty, "price": price})
         context.user_data["pending_order"] = {"type": "cart", "items": items, "address": address}
         context.user_data.pop("state", None)
         await show_delivery_selection_from_context(update, context)
@@ -1436,6 +1692,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
     data = query.data
     user_id = query.from_user.id
+
+    # Admin safety: if some admin restock flow mistakenly uses user qty_* callbacks,
+    # interpret them as selecting a product for restock (not user quantity controls).
+    try:
+        if is_admin(user_id) and (data.startswith("qty_inc:") or data.startswith("qty_dec:")):
+            msg_text = ""
+            try:
+                msg_text = (query.message.text or query.message.caption or "")
+            except Exception:
+                msg_text = ""
+            low = (msg_text or "").lower()
+            if "пополн" in low and "выберите" in low:
+                prod_id = int(data.split(":", 1)[1])
+                context.user_data["state"] = f"admin_restock_input:{prod_id}"
+                await safe_edit_message(query, "➕ Введите количество для пополнения товара:")
+                return
+    except Exception:
+        pass
     # Handle user-facing callbacks first (always), so user buttons work even if admin callbacks exist
     if (
         data.startswith("user_") or
@@ -1464,6 +1738,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 lp_id = context.chat_data.get("last_product_msg_id")
                 lp_chat = context.chat_data.get("last_product_chat")
                 if lp_id and lp_chat and lp_id == query.message.message_id and lp_chat == query.message.chat_id:
+                    # leaving a product card -> reset per-product quantity selections
+                    context.user_data.pop("qty_map", None)
                     await context.bot.delete_message(chat_id=query.message.chat_id, message_id=query.message.message_id)
                     context.chat_data.pop("last_product_msg_id", None)
                     context.chat_data.pop("last_product_chat", None)
@@ -1487,6 +1763,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             # clear transient state when user goes back
             context.user_data.pop("state", None)
             context.user_data.pop("pending_order", None)
+            context.user_data.pop("qty_map", None)  # Clear quantity selections
             text, markup = get_user_categories_markup()
             try:
                 await _cleanup_last_media(context, query.message.chat_id)
@@ -1631,7 +1908,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if stock <= 0 or cur_qty > stock:
                 await query.answer(f"❌ Доступное количество: {stock}", show_alert=True)
                 return
-            add_to_cart(user, prod_id)
+            add_to_cart(user, prod_id, qty=cur_qty, price=prod_cur.get("price", 0))
             # build temporary keyboard with confirmation
             prods = read_json(PROD_FILE)
             prod = next((p for p in prods if p.get("id") == prod_id), None)
@@ -1676,7 +1953,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             kb = []
             kb.append([InlineKeyboardButton("➖", callback_data=f"qty_dec:{prod_id}"), InlineKeyboardButton(str(cur_qty), callback_data="noop"), InlineKeyboardButton("➕", callback_data=f"qty_inc:{prod_id}")])
             kb.append([InlineKeyboardButton("✅ Добавлено в избранное", callback_data="noop")])
-            in_cart = prod_id in get_cart(user)
+            in_cart = is_in_cart(user, prod_id)
             if not in_cart:
                 kb.append([InlineKeyboardButton("🛒 В корзину", callback_data=f"user_add_to_cart:{prod_id}")])
             kb.append([InlineKeyboardButton("💳 Заказать", callback_data=f"user_buy:{prod_id}")])
@@ -1688,7 +1965,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 qty_map2 = context.user_data.setdefault("qty_map", {})
                 cur2 = int(qty_map2.get(prod_id, 1))
                 final.append([InlineKeyboardButton("➖", callback_data=f"qty_dec:{prod_id}"), InlineKeyboardButton(str(cur2), callback_data="noop"), InlineKeyboardButton("➕", callback_data=f"qty_inc:{prod_id}")])
-                in_cart2 = prod_id in get_cart(user)
+                in_cart2 = is_in_cart(user, prod_id)
                 if not in_cart2:
                     final.append([InlineKeyboardButton("🛒 В корзину", callback_data=f"user_add_to_cart:{prod_id}")])
                 final.append([InlineKeyboardButton("💳 Заказать", callback_data=f"user_buy:{prod_id}")])
@@ -1706,16 +1983,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if data == "user_buy_cart":
             # prepare items from cart and ask for address selection
             user = query.from_user.id
-            items_ids = get_cart(user)
-            if not items_ids:
+            cart_items = get_cart_items(user)
+            if not cart_items:
                 await safe_edit_message(query, "Ваша корзина пуста.")
                 return
             prods = read_json(PROD_FILE)
+            prods_by_id = {int(p.get("id")): p for p in prods if p.get("id") is not None}
             items = []
-            for pid in items_ids:
-                p = next((x for x in prods if x.get("id") == pid), None)
-                if p:
-                    items.append({"product_id": p.get('id'), "name": p.get('name'), "qty": 1, "price": p.get('price',0)})
+            # validate product existence + stock for requested qty
+            for ci in cart_items:
+                pid = int(ci.get("product_id"))
+                qty = int(ci.get("qty", 1) or 1)
+                p = prods_by_id.get(pid)
+                if not p:
+                    await safe_edit_message(query, "❌ Один из товаров в корзине был удалён")
+                    return
+                stock = int(p.get("stock", 0) or 0)
+                if stock <= 0 or qty > stock:
+                    name = (p.get("name") or "-").strip()
+                    await safe_edit_message(query, f"❌ Недостаточно товара: {name}\nДоступно: {stock}")
+                    return
+                price = ci.get("price")
+                if price is None:
+                    price = p.get("price", 0)
+                items.append({"product_id": pid, "name": p.get('name'), "qty": qty, "price": price})
             context.user_data["pending_order"] = {"type": "cart", "items": items}
             # If profile missing, collect it; otherwise show confirmation screen
             profiles = read_profiles()
@@ -1767,7 +2058,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 return
             cur += 1
             qty_map[prod_id] = cur
-            in_cart = prod_id in get_cart(query.from_user.id)
+            in_cart = is_in_cart(query.from_user.id, prod_id)
             in_fav = prod_id in get_favs(query.from_user.id)
             keyboard = [
                 [InlineKeyboardButton("➖", callback_data=f"qty_dec:{prod_id}"), InlineKeyboardButton(str(cur), callback_data="noop"), InlineKeyboardButton("➕", callback_data=f"qty_inc:{prod_id}")]
@@ -1793,7 +2084,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             cur = int(qty_map.get(prod_id, 1))
             cur = max(1, cur - 1)
             qty_map[prod_id] = cur
-            in_cart = prod_id in get_cart(query.from_user.id)
+            in_cart = is_in_cart(query.from_user.id, prod_id)
             in_fav = prod_id in get_favs(query.from_user.id)
             keyboard = [
                 [InlineKeyboardButton("➖", callback_data=f"qty_dec:{prod_id}"), InlineKeyboardButton(str(cur), callback_data="noop"), InlineKeyboardButton("➕", callback_data=f"qty_inc:{prod_id}")]
@@ -1920,6 +2211,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if data == "user_clear_cart":
             user = query.from_user.id
             clear_cart(user)
+            context.user_data.pop("qty_map", None)  # Clear quantity selections
             await safe_edit_message(query, "🗑 Корзина очищена.")
             return
 
@@ -1933,6 +2225,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     # Admin-only callbacks
+    if data.startswith("admin_restock_select:") and is_admin(user_id):
+        try:
+            prod_id = int(data.split(":", 1)[1])
+        except Exception:
+            await safe_edit_message(query, "Ошибка: товар не найден")
+            return
+        context.user_data["state"] = f"admin_restock_input:{prod_id}"
+        await safe_edit_message(query, f"➕ Введите количество для пополнения товара (ID {prod_id}):")
+        return
+
     if data == "admin_manage":
         # show admins list and management buttons
         admins_list = read_json(ADMINS_FILE)
@@ -2644,9 +2946,45 @@ async def finalize_order(source, context: ContextTypes.DEFAULT_TYPE):
         pending_ctx.get("delivery"),
         pending_ctx.get("type")
     )
+
+    # Reserve stock immediately to prevent concurrent purchases of the last items.
+    ok, err = _reserve_stock_for_pending(pending)
+    if not ok:
+        try:
+            # remove pending
+            pend_all = read_pending_orders()
+            pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending.get("id", 0))]
+            write_pending_orders(pend_all)
+        except Exception:
+            pass
+        await context.bot.send_message(chat_id=user.id, text=f"❌ Не удалось оформить заказ: {err or 'нет в наличии'}")
+        return
+
+    # Persist reservation flags
+    try:
+        pend_all = read_pending_orders()
+        for po in pend_all:
+            if int(po.get("id", 0)) == int(pending.get("id", 0)):
+                po["reserved"] = True
+                po["reserved_at"] = pending.get("reserved_at")
+                break
+        write_pending_orders(pend_all)
+    except Exception:
+        pass
     try:
         pay_url, payment_id = create_yookassa_payment(pending)
     except Exception as e:
+        # Release reserved stock if payment creation failed
+        try:
+            _release_stock_for_pending(pending)
+        except Exception:
+            pass
+        try:
+            pend_all = read_pending_orders()
+            pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending.get("id", 0))]
+            write_pending_orders(pend_all)
+        except Exception:
+            pass
         await context.bot.send_message(chat_id=user.id, text=f"❌ Ошибка создания оплаты: {e}")
         return
     pend_all = read_pending_orders()
@@ -2903,22 +3241,46 @@ async def poll_payment_and_finalize(
                     created_at=pending.get("created_at"),
                 )
 
-                # Decrease stock and alert admins if low/out-of-stock
+                # Decrease stock and alert admins if low/out-of-stock (skip if already reserved)
                 try:
-                    prods_all = read_json(PROD_FILE)
-                    events = []
-                    for it in order.get("items", []):
-                        for p in prods_all:
-                            if int(p.get("id", 0)) == int(it.get("product_id", 0)):
-                                old_stock = int(p.get("stock", 0) or 0)
-                                p["stock"] = max(0, old_stock - int(it.get("qty", 1)))
-                                new_stock = int(p.get("stock", 0) or 0)
-                                if new_stock == 0:
-                                    events.append(("out", p.copy()))
-                                elif new_stock <= 3 and old_stock > 3:
-                                    events.append(("low", p.copy()))
-                                break
-                    write_json(PROD_FILE, prods_all)
+                    if pending.get("reserved"):
+                        # stock was already decreased at payment creation
+                        prods_all = read_json(PROD_FILE)
+                        prods_by_id = {int(p.get("id")): p for p in prods_all if p.get("id") is not None}
+                        events = []
+                        seen = set()
+                        for it in order.get("items", []):
+                            try:
+                                pid = int(it.get("product_id", 0))
+                            except Exception:
+                                continue
+                            if pid in seen:
+                                continue
+                            seen.add(pid)
+                            p = prods_by_id.get(pid)
+                            if not p:
+                                continue
+                            new_stock = int(p.get("stock", 0) or 0)
+                            if new_stock == 0:
+                                events.append(("out", p.copy()))
+                            elif new_stock <= 3:
+                                events.append(("low", p.copy()))
+                    else:
+                        prods_all = read_json(PROD_FILE)
+                        events = []
+                        for it in order.get("items", []):
+                            for p in prods_all:
+                                if int(p.get("id", 0)) == int(it.get("product_id", 0)):
+                                    old_stock = int(p.get("stock", 0) or 0)
+                                    p["stock"] = max(0, old_stock - int(it.get("qty", 1)))
+                                    new_stock = int(p.get("stock", 0) or 0)
+                                    if new_stock == 0:
+                                        events.append(("out", p.copy()))
+                                    elif new_stock <= 3 and old_stock > 3:
+                                        events.append(("low", p.copy()))
+                                    break
+                        write_json(PROD_FILE, prods_all)
+
                     admins = read_json(ADMINS_FILE)
                     for kind, prod_event in events:
                         for aid in admins:
@@ -2974,6 +3336,16 @@ async def poll_payment_and_finalize(
                 return
 
             elif status in ("canceled", "expired"):  # optional handling
+                # Release reserved stock and remove pending
+                try:
+                    pend_all = read_pending_orders()
+                    pending = next((p for p in pend_all if int(p.get("id", 0)) == int(pending_id)), None)
+                    if pending:
+                        _release_stock_for_pending(pending)
+                        pend_all = [p for p in pend_all if int(p.get("id", 0)) != int(pending_id)]
+                        write_pending_orders(pend_all)
+                except Exception:
+                    pass
                 try:
                     await context.bot.send_message(chat_id=user_id, text="❌ Оплата не прошла")
                 except Exception:
@@ -3193,7 +3565,7 @@ async def send_product_card_user(chat_id: int, context: ContextTypes.DEFAULT_TYP
     in_fav = False
     if user_id is not None:
         try:
-            in_cart = prod.get('id') in get_cart(user_id)
+            in_cart = is_in_cart(user_id, prod.get('id'))
         except Exception:
             in_cart = False
         try:
@@ -3224,11 +3596,30 @@ async def send_product_card_user(chat_id: int, context: ContextTypes.DEFAULT_TYP
     if stock > 0:
         keyboard.append([InlineKeyboardButton("💳 Заказать", callback_data=f"user_buy:{prod['id']}")])
     else:
-        keyboard.append([InlineKeyboardButton("🔔 Уведомить о поступлении", callback_data=f"notify:{prod['id']}")])
+        # Role split: admins should get restock, users should get notify
+        try:
+            if user_id is not None and is_admin(int(user_id)):
+                keyboard.append([InlineKeyboardButton("➕ Пополнить товар", callback_data=f"admin_restock:{prod['id']}")])
+            else:
+                keyboard.append([InlineKeyboardButton("🔔 Уведомить о поступлении", callback_data=f"notify:{prod['id']}")])
+        except Exception:
+            keyboard.append([InlineKeyboardButton("🔔 Уведомить о поступлении", callback_data=f"notify:{prod['id']}")])
     keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"user_cat:{prod.get('category_id')}")])
 
     if photos:
+        # Telegram photo caption limit is 1024 chars; if text is longer, send photo with a short caption
         caption = text
+        extra_text = None
+        if isinstance(caption, str) and len(caption) > 1024:
+            short = (
+                f"{title}\n"
+                f"💰 Цена: {price} ₽\n"
+                f"{availability_line}"
+            )
+            if len(short) > 1024:
+                short = short[:1020] + "..."
+            extra_text = caption
+            caption = short
         try:
             msg = await bot.send_photo(chat_id=chat_id, photo=photos[0], caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
             context.chat_data["last_media_ids"] = [msg.message_id]
@@ -3236,6 +3627,11 @@ async def send_product_card_user(chat_id: int, context: ContextTypes.DEFAULT_TYP
             # track last product message to avoid duplicate category on back
             context.chat_data["last_product_msg_id"] = msg.message_id
             context.chat_data["last_product_chat"] = chat_id
+            if extra_text:
+                try:
+                    await bot.send_message(chat_id=chat_id, text=extra_text)
+                except Exception:
+                    pass
             return
         except Exception:
             pass
@@ -3252,8 +3648,8 @@ async def show_user_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ensure_data_files()
     try:
         user = update.effective_user.id
-        items = get_cart(user)
-        if not items:
+        cart_items = get_cart_items(user)
+        if not cart_items:
             try:
                 await _cleanup_last_media(context, update.message.chat_id)
             except Exception:
@@ -3261,20 +3657,34 @@ async def show_user_cart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("🛒 Ваша корзина пуста.")
             return
         prods = read_json(PROD_FILE)
+        prods_by_id = {int(p.get("id")): p for p in prods if p.get("id") is not None}
         keyboard = []
         lines = []
         total = 0.0
-        for pid in items:
-            p = next((x for x in prods if x.get("id") == pid), None)
+        for ci in cart_items:
+            try:
+                pid = int(ci.get("product_id"))
+            except Exception:
+                continue
+            p = prods_by_id.get(pid)
             if p:
-                price_raw = p.get("price", 0)
+                price_raw = ci.get("price")
+                if price_raw is None:
+                    price_raw = p.get("price", 0)
                 try:
                     price = float(price_raw)
                 except (TypeError, ValueError):
                     price = 0.0
-                total += price
+                try:
+                    qty = int(ci.get("qty", 1) or 1)
+                except Exception:
+                    qty = 1
+                if qty < 1:
+                    qty = 1
+                total += price * qty
                 name = (p.get('name') or '-').strip()
-                lines.append(f"• {name} — {p.get('price','-')} ₽")
+                # show stored price per unit
+                lines.append(f"• {name} — {price_raw} ₽ × {qty}")
                 keyboard.append([InlineKeyboardButton(f"🛒 {name}", callback_data=f"user_prod:{p.get('id')}")])
         total_str = str(int(round(total))) if abs(total - round(total)) < 1e-9 else (f"{total:.2f}".rstrip("0").rstrip("."))
         # buy all / clear / back
@@ -3416,22 +3826,44 @@ async def _finalize_paid_pending(context: ContextTypes.DEFAULT_TYPE, pending: di
         created_at=pending.get("created_at"),
     )
 
-    # Decrease stock and notify admins (reuse existing helpers)
+    # Decrease stock and notify admins (skip decrement if already reserved)
     try:
-        prods_all = read_json(PROD_FILE)
         events = []
-        for it in order.get("items", []):
-            for p in prods_all:
-                if int(p.get("id", 0)) == int(it.get("product_id", 0)):
-                    old_stock = int(p.get("stock", 0) or 0)
-                    p["stock"] = max(0, old_stock - int(it.get("qty", 1)))
-                    new_stock = int(p.get("stock", 0) or 0)
-                    if new_stock == 0:
-                        events.append(("out", p.copy()))
-                    elif new_stock <= 3 and old_stock > 3:
-                        events.append(("low", p.copy()))
-                    break
-        write_json(PROD_FILE, prods_all)
+        if pending.get("reserved"):
+            prods_all = read_json(PROD_FILE)
+            prods_by_id = {int(p.get("id")): p for p in prods_all if p.get("id") is not None}
+            seen = set()
+            for it in order.get("items", []):
+                try:
+                    pid = int(it.get("product_id", 0))
+                except Exception:
+                    continue
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                p = prods_by_id.get(pid)
+                if not p:
+                    continue
+                new_stock = int(p.get("stock", 0) or 0)
+                if new_stock == 0:
+                    events.append(("out", p.copy()))
+                elif new_stock <= 3:
+                    events.append(("low", p.copy()))
+        else:
+            prods_all = read_json(PROD_FILE)
+            for it in order.get("items", []):
+                for p in prods_all:
+                    if int(p.get("id", 0)) == int(it.get("product_id", 0)):
+                        old_stock = int(p.get("stock", 0) or 0)
+                        p["stock"] = max(0, old_stock - int(it.get("qty", 1)))
+                        new_stock = int(p.get("stock", 0) or 0)
+                        if new_stock == 0:
+                            events.append(("out", p.copy()))
+                        elif new_stock <= 3 and old_stock > 3:
+                            events.append(("low", p.copy()))
+                        break
+            write_json(PROD_FILE, prods_all)
+
         for kind, prod_event in events:
             if kind == "out":
                 await notify_admin_out_of_stock(context, prod_event)
@@ -3522,6 +3954,10 @@ async def reconcile_pending_payments_once(app) -> None:
                 except Exception:
                     pass
                 try:
+                    _release_stock_for_pending(pending)
+                except Exception:
+                    pass
+                try:
                     pend_now = read_pending_orders()
                     pend_now = [p for p in pend_now if str(p.get("payment_id")) != str(pid)]
                     write_pending_orders(pend_now)
@@ -3549,7 +3985,13 @@ def main() -> None:
         except Exception:
             pass
 
-    app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
+    # Increase request timeouts to avoid startup failures on slow networks (getMe timeout)
+    try:
+        from telegram.request import HTTPXRequest
+        req = HTTPXRequest(connect_timeout=30, read_timeout=30, write_timeout=30, pool_timeout=30)
+        app = ApplicationBuilder().token(TOKEN).request(req).post_init(_post_init).build()
+    except Exception:
+        app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
     register_handlers(app)
 
     print("Bot is running (press Ctrl-C to stop)")

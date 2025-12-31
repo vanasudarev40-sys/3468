@@ -14,6 +14,8 @@ from bot import (
     write_json,
     create_order,
     clear_cart,
+    _interprocess_lock,
+    _products_lock_path,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,7 +26,7 @@ app = FastAPI()
 
 def read_pending():
     try:
-        return json.loads(Path(PENDING_FILE).read_text(encoding="utf-8")) if isinstance(PENDING_FILE, Path) else json.loads(Path(PENDING_FILE).read_text(encoding="utf-8"))
+        return json.loads(Path(PENDING_FILE).read_text(encoding="utf-8"))
     except Exception:
         return []
 
@@ -38,10 +40,14 @@ async def yookassa_webhook(request: Request):
     if event == "payment.succeeded":
         payment = data.get("object", {})
         meta = payment.get("metadata", {})
-        order_id = meta.get("order_id")
+        order_id_raw = meta.get("order_id")
+        try:
+            order_id = int(order_id_raw)
+        except Exception:
+            return {"status": "ignored"}
         user_id = int(meta.get("user_id")) if meta.get("user_id") else None
         pend = read_pending()
-        pending = next((p for p in pend if int(p.get("id", 0)) == int(order_id)), None)
+        pending = next((p for p in pend if int(p.get("id", 0)) == order_id), None)
         if not pending:
             return {"status": "ignored"}
         # create real order
@@ -64,22 +70,44 @@ async def yookassa_webhook(request: Request):
             payment_id=pending.get("payment_id"),
             created_at=pending.get("created_at"),
         )
-        # decrease stock and alert admins if low/out-of-stock
+        # decrease stock and alert admins if low/out-of-stock (skip if already reserved)
         try:
-            prods_all = read_json(PROD_FILE)
             events = []
-            for it in order.get("items", []):
-                for p in prods_all:
-                    if int(p.get("id", 0)) == int(it.get("product_id", 0)):
-                        old_stock = int(p.get("stock", 0) or 0)
-                        p["stock"] = max(0, old_stock - int(it.get("qty", 1)))
-                        new_stock = int(p.get("stock", 0) or 0)
-                        if new_stock == 0:
-                            events.append(("out", p.copy()))
-                        elif new_stock <= 3 and old_stock > 3:
-                            events.append(("low", p.copy()))
-                        break
-            write_json(PROD_FILE, prods_all)
+            if pending.get("reserved"):
+                prods_all = read_json(PROD_FILE)
+                prods_by_id = {int(p.get("id")): p for p in prods_all if p.get("id") is not None}
+                seen = set()
+                for it in order.get("items", []):
+                    try:
+                        pid = int(it.get("product_id", 0))
+                    except Exception:
+                        continue
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    p = prods_by_id.get(pid)
+                    if not p:
+                        continue
+                    new_stock = int(p.get("stock", 0) or 0)
+                    if new_stock == 0:
+                        events.append(("out", p.copy()))
+                    elif new_stock <= 3:
+                        events.append(("low", p.copy()))
+            else:
+                with _interprocess_lock(_products_lock_path()):
+                    prods_all = read_json(PROD_FILE)
+                    for it in order.get("items", []):
+                        for p in prods_all:
+                            if int(p.get("id", 0)) == int(it.get("product_id", 0)):
+                                old_stock = int(p.get("stock", 0) or 0)
+                                p["stock"] = max(0, old_stock - int(it.get("qty", 1)))
+                                new_stock = int(p.get("stock", 0) or 0)
+                                if new_stock == 0:
+                                    events.append(("out", p.copy()))
+                                elif new_stock <= 3 and old_stock > 3:
+                                    events.append(("low", p.copy()))
+                                break
+                    write_json(PROD_FILE, prods_all)
             if TOKEN:
                 try:
                     bot = Bot(token=TOKEN)
@@ -113,7 +141,7 @@ async def yookassa_webhook(request: Request):
         except Exception:
             pass
         # remove from pending
-        pend = [p for p in pend if int(p.get("id", 0)) != int(order_id)]
+        pend = [p for p in pend if int(p.get("id", 0)) != order_id]
         write_pending(pend)
         # notify user
         if TOKEN and user_id:

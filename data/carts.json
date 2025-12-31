@@ -8,8 +8,16 @@
   {
     "user_id": 5240806878,
     "items": [
-      5,
-      1
+      {
+        "product_id": 5,
+        "qty": 1,
+        "price": 0
+      },
+      {
+        "product_id": 1,
+        "qty": 1,
+        "price": 1
+      }
     ]
   }
 ]
