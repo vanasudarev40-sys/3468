@@ -1,0 +1,48 @@
+[
+  {
+    "id": 1,
+    "number": 1012,
+    "user_id": 5240806878,
+    "username": "Gggggikhh",
+    "full_name": "່ ່⁣ ⁣",
+    "items": [
+      {
+        "product_id": 5,
+        "name": "📂 Каталог",
+        "qty": 1,
+        "price": 1500
+      }
+    ],
+    "total": 1500,
+    "address": "Лсрврсос",
+    "delivery": "Яндекс",
+    "status": "new",
+    "created_at": 1766844733.25145,
+    "client": {
+      "first_name": "Андрей",
+      "last_name": "Сударев",
+      "phone": "79000480927"
+    },
+    "payment_id": null
+  },
+  {
+    "id": 2,
+    "number": 1021,
+    "user_id": 5240806878,
+    "username": "Gggggikhh",
+    "full_name": "່ ່⁣ ⁣",
+    "items": [],
+    "total": 0,
+    "address": "Лсрврсос",
+    "delivery": "Яндекс",
+    "status": "new",
+    "created_at": 1767188459.2505481,
+    "client": {
+      "first_name": "Андрей",
+      "last_name": "Сударев",
+      "phone": "79000480927"
+    },
+    "type": "cart",
+    "payment_id": null
+  }
+]

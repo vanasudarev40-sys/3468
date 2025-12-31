@@ -1,0 +1,6 @@
+{
+  "new_product": {
+    "enabled": true,
+    "template": "🆕 Появился новый товар!\n\n{name}\n💰 Цена: {price}\n\n👇 Нажмите, чтобы посмотреть"
+  }
+}
